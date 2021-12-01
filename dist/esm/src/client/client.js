@@ -1,0 +1,508 @@
+/*
+ * Deepkit Framework
+ * Copyright (C) 2021 Deepkit UG, Marc J. Schmidt
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the MIT License.
+ *
+ * You should have received a copy of the MIT License along with this program.
+ */
+import { asyncOperation, sleep } from '@deepkit/core';
+import { BehaviorSubject, Subject } from 'rxjs';
+import { rpcAuthenticate, rpcClientId, rpcPeerDeregister, rpcPeerRegister, rpcResponseAuthenticate, RpcTypes } from '../model';
+import { createRpcMessage, createRpcMessagePeer, ErroredRpcMessage, RpcMessageReader } from '../protocol';
+import { RpcKernel, RpcKernelConnection } from '../server/kernel';
+import { ClientProgress, RpcMessageWriter, RpcMessageWriterOptions } from '../writer';
+import { RpcActionClient, RpcControllerState } from './action';
+import { RpcMessageSubject } from './message-subject';
+export class OfflineError extends Error {
+    constructor(message = 'Offline') {
+        super(message);
+    }
+}
+export class RpcClientToken {
+    constructor(token) {
+        this.token = token;
+    }
+    get() {
+        return this.token;
+    }
+    set(v) {
+        this.token = v;
+    }
+    has() {
+        return this.token !== undefined;
+    }
+}
+export class RpcClientTransporter {
+    constructor(transport) {
+        this.transport = transport;
+        this.connectionTries = 0;
+        this.connectionId = 0;
+        this.connected = false;
+        this.writerOptions = new RpcMessageWriterOptions;
+        /**
+         * true when the connection fully established (after authentication)
+         */
+        this.connection = new BehaviorSubject(false);
+        this.reconnected = new Subject();
+        this.disconnected = new Subject();
+        this.reader = new RpcMessageReader((v) => this.onMessage(v), (id) => {
+            if (this.writer) {
+                this.writer.write(createRpcMessage(id, RpcTypes.ChunkAck));
+            }
+        });
+    }
+    bufferedAmount() {
+        var _a;
+        if (!((_a = this.transportConnection) === null || _a === void 0 ? void 0 : _a.bufferedAmount))
+            return 0;
+        return this.transportConnection.bufferedAmount();
+    }
+    clientAddress() {
+        var _a;
+        if (!((_a = this.transportConnection) === null || _a === void 0 ? void 0 : _a.clientAddress))
+            return 'unknown';
+        return this.transportConnection.clientAddress();
+    }
+    /**
+     * True when fully connected (after successful handshake and authentication)
+     */
+    isConnected() {
+        return this.connected;
+    }
+    onError() {
+        this.onDisconnect();
+    }
+    onDisconnect() {
+        this.id = undefined;
+        this.connectionPromise = undefined;
+        if (this.connected) {
+            this.connection.next(false);
+            this.connected = false;
+            const id = this.connectionId;
+            this.connectionId++;
+            this.disconnected.next(id);
+        }
+    }
+    onConnect() {
+        this.connection.next(true);
+        if (this.connectionId > 0) {
+            this.reconnected.next(this.connectionId);
+        }
+    }
+    /**
+     * Optional handshake.
+     * When peer messages are allowed, this needs to request the client id and returns id.
+     */
+    async onHandshake() {
+        return undefined;
+    }
+    async onAuthenticate() {
+    }
+    onMessage(message) {
+    }
+    disconnect() {
+        if (this.transportConnection) {
+            this.transportConnection.close();
+            this.transportConnection = undefined;
+        }
+        this.onDisconnect();
+    }
+    async doConnect() {
+        this.connectionTries++;
+        if (this.transportConnection) {
+            this.transportConnection.close();
+            this.transportConnection = undefined;
+        }
+        return asyncOperation(async (resolve, reject) => {
+            try {
+                await this.transport.connect({
+                    onClose: () => {
+                        this.onDisconnect();
+                    },
+                    onConnected: async (transport) => {
+                        this.transportConnection = transport;
+                        this.writer = new RpcMessageWriter({
+                            write(v) {
+                                transport.send(v);
+                            },
+                            close() {
+                                transport.close();
+                            },
+                            clientAddress: transport.clientAddress ? () => transport.clientAddress() : undefined,
+                            bufferedAmount: transport.bufferedAmount ? () => transport.bufferedAmount() : undefined,
+                        }, this.reader, this.writerOptions);
+                        this.connected = false;
+                        this.connectionTries = 0;
+                        try {
+                            this.id = await this.onHandshake();
+                            await this.onAuthenticate();
+                        }
+                        catch (error) {
+                            this.connected = false;
+                            this.connectionTries = 0;
+                            reject(error);
+                            return;
+                        }
+                        this.connected = true;
+                        this.onConnect();
+                        resolve(undefined);
+                    },
+                    onError: (error) => {
+                        this.onError();
+                        reject(new OfflineError(`Could not connect: ${error.message}`));
+                    },
+                    onData: (buffer, bytes) => {
+                        this.reader.feed(buffer, bytes);
+                    },
+                });
+            }
+            catch (error) {
+                reject(error);
+            }
+        });
+    }
+    /**
+     * Simply connect with login using the token, without auto re-connect.
+     */
+    async connect() {
+        while (this.connectionPromise) {
+            await this.connectionPromise;
+            await sleep(0.01);
+        }
+        if (this.connected) {
+            return;
+        }
+        this.connectionPromise = this.doConnect();
+        try {
+            await this.connectionPromise;
+        }
+        finally {
+            delete this.connectionPromise;
+        }
+    }
+    send(message, progress) {
+        if (this.writer === undefined) {
+            throw new Error('Transport connection not created yet');
+        }
+        try {
+            this.writer.write(message, progress);
+        }
+        catch (error) {
+            throw new OfflineError(error);
+        }
+    }
+}
+export class RpcClientPeer {
+    constructor(actionClient, peerId, onDisconnect) {
+        this.actionClient = actionClient;
+        this.peerId = peerId;
+        this.onDisconnect = onDisconnect;
+    }
+    controller(nameOrDefinition, options = {}) {
+        const controller = new RpcControllerState('string' === typeof nameOrDefinition ? nameOrDefinition : nameOrDefinition.path);
+        controller.peerId = this.peerId;
+        return new Proxy(this, {
+            get: (target, propertyName) => {
+                return (...args) => {
+                    return this.actionClient.action(controller, propertyName, args, options);
+                };
+            }
+        });
+    }
+    disconnect() {
+        this.onDisconnect(this.peerId);
+    }
+}
+export class RpcBaseClient {
+    constructor(transport) {
+        this.transport = transport;
+        this.messageId = 1;
+        this.replies = new Map();
+        this.actionClient = new RpcActionClient(this);
+        this.token = new RpcClientToken(undefined);
+        this.typeReuseDisabled = false;
+        this.events = new Subject();
+        this.transporter = new RpcClientTransporter(this.transport);
+        this.transporter.onMessage = this.onMessage.bind(this);
+        this.transporter.onHandshake = this.onHandshake.bind(this);
+        this.transporter.onAuthenticate = this.onAuthenticate.bind(this);
+    }
+    /**
+     * Per default entity types with a name (@entity.name()) will be reused. If a entity with a given name
+     * was not loaded and error is thrown. This to ensure nominal typing (object instanceof T).
+     * Use this method to disable this behavior and construct new nominal types if an entity is not loaded.
+     */
+    disableTypeReuse() {
+        this.typeReuseDisabled = true;
+        return this;
+    }
+    /**
+     * The connection process is only finished when this method resolves and doesn't throw.
+     * When an error is thrown, the authentication was unsuccessful.
+     *
+     * If you use controllers in this callback, make sure to use dontWaitForConnection=true, otherwise you get an endless loop.
+     *
+     * ```typescript
+     * async onAuthenticate(): Promise<void> {
+     *     const auth = this.controller<AuthController>('auth', {dontWaitForConnection: true});
+     *     const result = auth.login('username', 'password');
+     *     if (!result) throw new AuthenticationError('Authentication failed);
+     * }
+     * ```
+     */
+    async onAuthenticate() {
+        if (!this.token.has())
+            return;
+        const reply = await this.sendMessage(RpcTypes.Authenticate, rpcAuthenticate, { token: this.token.get() }, { dontWaitForConnection: true })
+            .waitNextMessage();
+        if (reply.isError())
+            throw reply.getError();
+        if (reply.type === RpcTypes.AuthenticateResponse) {
+            const body = reply.parseBody(rpcResponseAuthenticate);
+            this.username = body.username;
+            return;
+        }
+        throw new Error('Invalid response');
+    }
+    async onHandshake() {
+        return undefined;
+    }
+    getId() {
+        throw new Error('RpcBaseClient does not load its client id, and thus does not support peer message');
+    }
+    onMessage(message) {
+        if (this.events.observers.length) {
+            this.events.next({
+                event: 'incoming',
+                ...message.debug(),
+            });
+        }
+        // console.log('client: received message', message.id, message.type, RpcTypes[message.type], message.routeType);
+        if (message.type === RpcTypes.Entity) {
+            this.actionClient.entityState.handle(message);
+        }
+        else {
+            const callback = this.replies.get(message.id);
+            if (!callback) {
+                throw new Error('No callback for ' + message.id);
+            }
+            if (callback)
+                callback(message);
+        }
+    }
+    sendMessage(type, schema, body, options = {}) {
+        const id = this.messageId++;
+        const connectionId = options && options.connectionId ? options.connectionId : this.transporter.connectionId;
+        const dontWaitForConnection = !!options.dontWaitForConnection;
+        // const timeout = options && options.timeout ? options.timeout : 0;
+        const continuation = (type, schema, body) => {
+            if (connectionId === this.transporter.connectionId) {
+                //send a message with the same id. Don't use sendMessage() again as this would lead to a memory leak
+                // and a new id generated. We want to use the same id.
+                if (this.events.observers.length) {
+                    this.events.next({
+                        event: 'outgoing',
+                        date: new Date,
+                        id, type, body, messages: [], composite: false
+                    });
+                }
+                const message = createRpcMessage(id, type, schema, body);
+                this.transporter.send(message);
+            }
+        };
+        const subject = new RpcMessageSubject(continuation, () => {
+            this.replies.delete(id);
+        });
+        this.replies.set(id, (v) => subject.next(v));
+        const progress = ClientProgress.getNext();
+        if (progress) {
+            this.transporter.reader.registerProgress(id, progress.download);
+        }
+        if (dontWaitForConnection || this.transporter.isConnected()) {
+            const message = options && options.peerId
+                ? createRpcMessagePeer(id, type, this.getId(), options.peerId, schema, body)
+                : createRpcMessage(id, type, schema, body);
+            if (this.events.observers.length) {
+                this.events.next({
+                    event: 'outgoing',
+                    date: new Date,
+                    id, type, body, messages: [], composite: false
+                });
+            }
+            this.transporter.send(message, progress === null || progress === void 0 ? void 0 : progress.upload);
+        }
+        else {
+            this.transporter.connect().then(() => {
+                //this.getId() only now available
+                const message = options && options.peerId
+                    ? createRpcMessagePeer(id, type, this.getId(), options.peerId, schema, body)
+                    : createRpcMessage(id, type, schema, body);
+                if (this.events.observers.length) {
+                    this.events.next({
+                        event: 'outgoing',
+                        date: new Date,
+                        id, type, body, messages: [], composite: false
+                    });
+                }
+                this.transporter.send(message, progress === null || progress === void 0 ? void 0 : progress.upload);
+            }, (e) => {
+                subject.next(new ErroredRpcMessage(id, e));
+            });
+        }
+        return subject;
+    }
+    async connect() {
+        await this.transporter.connect();
+        return this;
+    }
+    disconnect() {
+        this.transporter.disconnect();
+    }
+}
+export class RpcClient extends RpcBaseClient {
+    constructor() {
+        super(...arguments);
+        this.peerConnections = new Map();
+        this.peerKernelConnection = new Map();
+    }
+    async onHandshake() {
+        this.clientKernelConnection = undefined;
+        const reply = await this.sendMessage(RpcTypes.ClientId, undefined, undefined, { dontWaitForConnection: true })
+            .firstThenClose(RpcTypes.ClientIdResponse, rpcClientId);
+        return reply.id;
+    }
+    async ping() {
+        await this.sendMessage(RpcTypes.Ping).waitNext(RpcTypes.Pong);
+    }
+    onMessage(message) {
+        if (message.routeType === 3 /* peer */) {
+            if (!this.peerKernel)
+                return;
+            const peerId = message.getPeerId();
+            if (this.registeredAsPeer !== peerId)
+                return;
+            let connection = this.peerKernelConnection.get(peerId);
+            if (!connection) {
+                //todo: create a connection per message.getSource()
+                const writer = {
+                    close: () => {
+                        if (connection)
+                            connection.close();
+                        this.peerKernelConnection.delete(peerId);
+                    },
+                    write: (answer) => {
+                        //should we modify the package?
+                        this.transporter.send(answer);
+                    }
+                };
+                //todo: set up timeout for idle detection. Make the timeout configurable
+                const c = this.peerKernel.createConnection(writer);
+                if (!(c instanceof RpcKernelConnection))
+                    throw new Error('Expected RpcKernelConnection from peerKernel.createConnection');
+                connection = c;
+                connection.myPeerId = peerId; //necessary so that the kernel does not redirect the package again.
+                this.peerKernelConnection.set(peerId, connection);
+            }
+            connection.handleMessage(message);
+        }
+        else {
+            if (message.routeType === 1 /* server */ && this.clientKernel) {
+                if (!this.clientKernelConnection) {
+                    const c = this.clientKernel.createConnection({
+                        write: (answer) => {
+                            this.transporter.send(answer);
+                        },
+                        close: () => {
+                            this.transporter.disconnect();
+                        },
+                        clientAddress: () => {
+                            return this.transporter.clientAddress();
+                        },
+                        bufferedAmount: () => {
+                            return this.transporter.bufferedAmount();
+                        }
+                    });
+                    if (!(c instanceof RpcKernelConnection))
+                        throw new Error('Expected RpcKernelConnection from clientKernel.createConnection');
+                    this.clientKernelConnection = c;
+                }
+                this.clientKernelConnection.routeType = 1 /* server */;
+                this.clientKernelConnection.handleMessage(message);
+                return;
+            }
+            super.onMessage(message);
+        }
+    }
+    getId() {
+        if (!this.transporter.id)
+            throw new Error('Not fully connected yet');
+        return this.transporter.id;
+    }
+    /**
+     * Registers a new controller for the peer's RPC kernel.
+     * Use `registerAsPeer` first.
+     */
+    registerPeerController(nameOrDefinition, classType) {
+        if (!this.peerKernel)
+            throw new Error('Not registered as peer. Call registerAsPeer() first');
+        this.peerKernel.registerController('string' === typeof nameOrDefinition ? nameOrDefinition : nameOrDefinition.path, classType);
+    }
+    /**
+     * Registers a new controller for the server's RPC kernel.
+     * This is when the server wants to communicate actively with the client (us).
+     */
+    registerController(nameOrDefinition, classType) {
+        if (!this.clientKernel)
+            this.clientKernel = new RpcKernel();
+        this.clientKernel.registerController('string' === typeof nameOrDefinition ? nameOrDefinition : nameOrDefinition.path, classType);
+    }
+    async registerAsPeer(id) {
+        if (this.registeredAsPeer) {
+            throw new Error('Already registered as a peer');
+        }
+        this.peerKernel = new RpcKernel();
+        await this.sendMessage(RpcTypes.PeerRegister, rpcPeerRegister, { id }).firstThenClose(RpcTypes.Ack);
+        this.registeredAsPeer = id;
+        return {
+            deregister: async () => {
+                await this.sendMessage(RpcTypes.PeerDeregister, rpcPeerDeregister, { id }).firstThenClose(RpcTypes.Ack);
+                this.registeredAsPeer = undefined;
+            }
+        };
+    }
+    /**
+     * Creates a new peer connection, or re-uses an existing non-disconnected one.
+     *
+     * Make sure to call disconnect() on it once you're done using it, otherwise the peer
+     * will leak memory. (connection will be dropped if idle for too long automatically tough)
+     */
+    peer(peerId) {
+        let peer = this.peerConnections.get(peerId);
+        if (peer)
+            return peer;
+        peer = new RpcClientPeer(this.actionClient, peerId, () => {
+            //todo, send disconnect message so the peer can release its kernel connection
+            // also implement a timeout on peer side
+            this.peerConnections.delete(peerId);
+        });
+        this.peerConnections.set(peerId, peer);
+        return peer;
+    }
+    controller(nameOrDefinition, options = {}) {
+        const controller = new RpcControllerState('string' === typeof nameOrDefinition ? nameOrDefinition : nameOrDefinition.path);
+        options = options || {};
+        if ('undefined' === typeof options.typeReuseDisabled) {
+            options.typeReuseDisabled = this.typeReuseDisabled;
+        }
+        return new Proxy(this, {
+            get: (target, propertyName) => {
+                return (...args) => {
+                    return this.actionClient.action(controller, propertyName, args, options);
+                };
+            }
+        });
+    }
+}
+//# sourceMappingURL=client.js.map
